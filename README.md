@@ -1,5 +1,7 @@
 📘 README.md — Python Multimedia Chat System (TCP + UDP)
+
 📌 Project Overview
+
   This project is a Python-based Multimedia Chat System that supports:
     ✅ Multi-client text messaging
     ✅ Private messaging (PM)
