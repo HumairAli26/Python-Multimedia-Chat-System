@@ -4,16 +4,16 @@
 
   This project is a Python-based Multimedia Chat System that supports:
   
-    ✅ Multi-client text messaging
-    ✅ Private messaging (PM)
-    ✅ Group / Room messaging
-    ✅ File sharing
-    ✅ Voice notes
-    ✅ Real-time audio calls
-    ✅ Real-time video calls
-    ✅ Active users list
-    ✅ Dark-mode GUI
-    ✅ Hybrid TCP + UDP architecture
+  ✅ Multi-client text messaging
+  ✅ Private messaging (PM)
+  ✅ Group / Room messaging
+  ✅ File sharing
+  ✅ Voice notes
+  ✅ Real-time audio calls
+  ✅ Real-time video calls
+  ✅ Active users list
+  ✅ Dark-mode GUI
+  ✅ Hybrid TCP + UDP architecture
     
   It uses TCP for control, messaging, and file transfer, while UDP is used for real-time audio and video streaming to ensure low latency and smooth performance.
   The user-friendly Tkinter GUI makes it easy to communicate, create rooms, share files, and start audio/video calls — all inside one application.
