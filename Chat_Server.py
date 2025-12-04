@@ -1,378 +1,265 @@
+"""
+Real-Time Multi-User Chat Application Server (Updated for Group Calls & Message Reliability)
+
+- FIX: Chat and File messages now reliably broadcast to all connected clients (except the sender) 
+       when sent to a room, addressing the issue where some users didn't receive messages.
+- Handles group_call_request and forwards call_data to all room members.
+"""
+
 import socket
 import threading
 import json
-import traceback
-from typing import Dict, Set, Tuple
+from datetime import datetime
 
-HOST = "0.0.0.0"   # listen on all interfaces
-TCP_PORT = 9009
-UDP_PORT = 9010 # Dedicated port for UDP media traffic
+class ChatServer:
+    def __init__(self, host='0.0.0.0', port=5555):
+        self.host = host
+        self.port = port
+        self.server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
-# Shared global state
-clients_lock = threading.Lock()
-clients: Dict[str, socket.socket] = {}       # username -> TCP socket
-conn_to_user: Dict[socket.socket, str] = {}  # TCP socket -> username
+        # state
+        self.clients = {}         # username -> socket
+        self.clients_lock = threading.Lock()
 
-# Mapping for UDP addresses
-user_to_udp_addr: Dict[str, Tuple[str, int]] = {} # username -> (ip, port) for receiving UDP
+        # NOTE: Rooms state is kept, but chat/file routing now uses the global client list for reliability (see process_message)
+        self.rooms = {'General': []}  # room_name -> list of usernames
+        self.rooms_lock = threading.Lock()
 
-rooms_lock = threading.Lock()
-rooms: Dict[str, Set[str]] = {}               # room_name -> set(usernames)
+        # active_calls still tracks both private (user->peer) and group (room->set of users)
+        self.active_calls = {}
 
-# UDP Socket
-udp_sock: socket.socket | None = None
-
-# Helper: send JSON object as a newline-terminated line (TCP)
-def send_json(sock: socket.socket, obj: dict):
-    """Sends a JSON object over a TCP socket."""
-    try:
-        # Use separators=(',', ':') for compact JSON and append newline
-        data = (json.dumps(obj, separators=(',', ':')) + '\n').encode('utf-8')
-        sock.sendall(data)
-    except Exception:
-        # socket may be closed / broken - ignore here
-        pass
-
-# --- FIXED: ADDED MISSING BROADCAST FUNCTION ---
-def broadcast(obj: dict, exclude_username: str = None):
-    """Sends a JSON object to all connected clients over TCP."""
-    with clients_lock:
-        targets = [s for user, s in clients.items() if user != exclude_username]
-    for s in targets:
-        send_json(s, obj)
-# ----------------------------------------------
-
-# Broadcast to a specific room (TCP - for control/text/file)
-def broadcast_room(room: str, obj: dict, exclude_username: str = None):
-    """Sends a JSON object to all TCP sockets in a specified room."""
-    with rooms_lock:
-        members = set(rooms.get(room, set()))
-    to_send = []
-    with clients_lock:
-        for user in members:
-            if user == exclude_username:
-                continue
-            sock = clients.get(user)
-            if sock:
-                to_send.append(sock)
-    for s in to_send:
-        send_json(s, obj)
-
-# Send active user list to everyone or a single connection
-def send_active_users(to_sock: socket.socket = None):
-    """Sends the list of active users over TCP."""
-    with clients_lock:
-        userlist = list(clients.keys())
-    msg = {"type": "active_list", "users": userlist}
-    
-    if to_sock:
-        send_json(to_sock, msg)
-    else:
-        # Broadcast to all
-        with clients_lock:
-            targets = list(clients.values())
-        for s in targets:
-            send_json(s, msg)
-
-def safe_remove_client_by_socket(sock: socket.socket):
-    """Safely removes a client and broadcasts disconnect notification."""
-    username = None
-    with clients_lock:
-        username = conn_to_user.pop(sock, None)
-        if username and username in clients:
-            try:
-                del clients[username]
-            except KeyError:
-                pass
-        # Remove UDP address on disconnect
-        if username in user_to_udp_addr:
-            print(f"[UDP] Unregistered {username}'s UDP address.")
-            del user_to_udp_addr[username]
-
-    if username:
-        # remove from all rooms
-        with rooms_lock:
-            for r in list(rooms.keys()):
-                if username in rooms[r]:
-                    rooms[r].discard(username)
-        
-        # notify others via TCP
-        broadcast({"type": "system", "msg": f"{username} left the chat."})
-        send_active_users()
-
-
-def handle_udp_packet(data: bytes, addr: Tuple[str, int]):
-    """
-    Handles incoming UDP data (media streams) and relays it to the target(s).
-    The format is expected to be: JSON_Header|Base64_Media_Data
-    """
-    global udp_sock
-    try:
-        # Find the delimiter '|' which separates JSON header from media data
-        delimiter_index = data.find(b'|')
-        if delimiter_index == -1:
-            return 
-        
-        json_header_bytes = data[:delimiter_index]
-        
+    def start(self):
+        self.server_sock.bind((self.host, self.port))
+        self.server_sock.listen()
+        print(f"[SERVER] Listening on {self.host}:{self.port}")
         try:
-            msg = json.loads(json_header_bytes.decode('utf-8'))
-        except json.JSONDecodeError:
-            print(f"[UDP] Malformed JSON header from {addr}")
-            return
+            while True:
+                client_sock, addr = self.server_sock.accept()
+                thr = threading.Thread(target=self.handle_client, args=(client_sock, addr), daemon=True)
+                thr.start()
+        except KeyboardInterrupt:
+            print("[SERVER] Shutting down")
+        finally:
+            self.server_sock.close()
 
-        mtype = msg.get('type')
-        username = msg.get('from')
-        to = msg.get('to')
-        room = msg.get('room')
-        
-        if mtype not in ('audio_stream', 'video_stream') or not username:
-            return
+    # ---------- sending helpers (unchanged) ----------
+    def send_json_to_sock(self, sock, data):
+        try:
+            payload = json.dumps(data) + "\n"
+            sock.send(payload.encode('utf-8'))
+        except Exception as e:
+            print("[SERVER] send_json_to_sock error:", e)
 
-        # 1. Register the client's UDP address upon first stream packet
-        with clients_lock:
-            if username not in user_to_udp_addr:
-                user_to_udp_addr[username] = addr
-                print(f"[UDP] Registered {username} UDP address via first packet: {addr}")
+    def send_to_client(self, username, data):
+        with self.clients_lock:
+            sock = self.clients.get(username)
+            if sock:
+                self.send_json_to_sock(sock, data)
 
-        # 2. Forward the entire raw packet (header + media data)
-        
-        # Forward to a specific user (PM)
-        if to:
-            with clients_lock:
-                target_addr = user_to_udp_addr.get(to)
-            if target_addr and udp_sock:
-                udp_sock.sendto(data, target_addr)
-
-        # Forward to a room
-        elif room:
-            with rooms_lock:
-                members = set(rooms.get(room, set()))
-            
-            target_addrs = []
-            with clients_lock:
-                for member in members:
-                    if member != username: # Do not send back to sender
-                        addr = user_to_udp_addr.get(member)
-                        if addr:
-                            target_addrs.append(addr)
-            
-            if udp_sock:
-                for target_addr in target_addrs:
-                    udp_sock.sendto(data, target_addr)
-
-    except Exception as e:
-        print(f"[!] UDP handling error: {e}")
-        traceback.print_exc()
-
-def udp_listener_thread():
-    """Listens for and relays media streams over UDP."""
-    print(f"UDP listener started on {HOST}:{UDP_PORT}")
-    global udp_sock
-    udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        udp_sock.bind((HOST, UDP_PORT))
-        
-        while True:
-            try:
-                data, addr = udp_sock.recvfrom(65535) 
-                # Hand off packet processing to a worker thread
-                threading.Thread(target=handle_udp_packet, args=(data, addr), daemon=True).start()
-            except socket.error:
-                break
-            except Exception as e:
-                print(f"[!] UDP thread inner loop error: {e}")
-                traceback.print_exc()
-    finally:
-        if udp_sock:
-            udp_sock.close()
-        print("UDP listener stopped.")
-
-
-def handle_client_connection(conn: socket.socket, addr: Tuple[str, int]):
-    """Handles TCP control and data (text, file, stream initiation)."""
-    print(f"[+] New TCP connection from {addr}")
-    buffer = b''    
-    username = None 
-    try:
-        # --- JOIN / REGISTRATION LOOP ---
-        while True:  
-            chunk = conn.recv(4096)
-            if not chunk:
-                return
-            buffer += chunk
-            while b'\n' in buffer:
-                line, buffer = buffer.split(b'\n', 1)
-                try:
-                    obj = json.loads(line.decode('utf-8'))
-                except Exception:
-                    continue 
-                if obj.get('type') == 'join' and 'from' in obj:
-                    username = obj['from']  
-                    
-                    # register (handle collision)
-                    with clients_lock: 
-                        base = username  
-                        counter = 1    
-                        while username in clients:
-                            username = f"{base}_{counter}"
-                            counter += 1
-                        clients[username] = conn
-                        conn_to_user[conn] = username
-                    print(f"[=] Registered user: {username} from {addr}")
-                    
-                    # Tell client the UDP server port (Crucial for Client setup)
-                    send_json(conn, {"type": "system", "msg": f"Welcome {username}! UDP Port: {UDP_PORT}"})
-                    
-                    # tell everyone else
-                    broadcast({"type": "system", "msg": f"{username} joined the chat."}, exclude_username=username)
-                    send_active_users()
-                    break # Exit registration loop
-            if username:
-                break
-        
-        # --- MAIN TCP RECEIVE LOOP (Control & Data) ---
-        while True:
-            chunk = conn.recv(16384) 
-            if not chunk:
-                break
-            buffer += chunk
-            while b'\n' in buffer:
-                line, buffer = buffer.split(b'\n', 1)
-                try:
-                    msg = json.loads(line.decode('utf-8'))
-                except Exception:
+    def broadcast(self, data, exclude=None):
+        with self.clients_lock:
+            for uname, sock in list(self.clients.items()):
+                if uname == exclude:
                     continue
+                self.send_json_to_sock(sock, data)
+
+    def broadcast_to_room(self, room, data, exclude=None):
+        # NOTE: This method is now only used for Group Call Signaling and End Call notifications,
+        # where explicit room membership (active_calls[room] or self.rooms[room]) is needed.
+        with self.rooms_lock:
+            users = list(self.rooms.get(room, []))
+        for uname in users:
+            if uname == exclude:
+                continue
+            self.send_to_client(uname, data)
+
+    def broadcast_client_list(self):
+        with self.clients_lock:
+            clients = list(self.clients.keys())
+        self.broadcast({'type':'client_list','clients':clients})
+
+    # ---------- main connection handler (unchanged logic) ----------
+    def handle_client(self, client_sock, addr):
+        username = None
+        try:
+            # initial username (raw, not JSON)
+            data = client_sock.recv(4096)
+            if not data: client_sock.close(); return
+            username = data.decode('utf-8').strip()
+            if not username: client_sock.close(); return
+
+            with self.clients_lock:
+                if username in self.clients:
+                    self.send_json_to_sock(client_sock, {'type':'error','message':'Username taken'})
+                    client_sock.close(); return
+                self.clients[username] = client_sock
+
+            with self.rooms_lock:
+                if 'General' not in self.rooms: self.rooms['General'] = []
+                if username not in self.rooms['General']: self.rooms['General'].append(username)
+
+            print(f"[SERVER] {username} connected from {addr}")
+            self.send_json_to_sock(client_sock, {'type':'welcome','message':f'Welcome {username}','rooms': list(self.rooms.keys())})
+            self.broadcast({'type':'user_joined','username':username,'timestamp':datetime.now().strftime('%H:%M:%S')}, exclude=username)
+            self.broadcast_client_list()
+
+            buffer = ""
+            decoder = json.JSONDecoder()
+            while True:
+                chunk = client_sock.recv(1024*1024)
+                if not chunk: break
+                buffer += chunk.decode('utf-8', errors='ignore')
+                while buffer:
+                    buffer = buffer.lstrip()
+                    try:
+                        obj, idx = decoder.raw_decode(buffer)
+                        buffer = buffer[idx:]
+                        self.process_message(username, obj)
+                    except ValueError: break
+        except Exception as e:
+            print("[SERVER] handle_client error for", username, e)
+        finally:
+            self.disconnect(username)
+
+    # ---------- message routing (FIXED for Chat/File Reliability) ----------
+    def process_message(self, sender, message):
+        mtype = message.get('type')
+        if mtype == 'chat':
+            room = message.get('room','General')
+            payload = {'type':'chat','sender': sender,'message': message.get('message'),'room': room,'timestamp': datetime.now().strftime('%H:%M:%S')}
+            
+            # FIX: Use global broadcast for general chat messages. Client filters by current_room.
+            self.broadcast(payload, exclude=sender) 
+            
+        elif mtype == 'private':
+            recipient = message.get('recipient')
+            payload = {'type':'private','sender': sender,'message': message.get('message'),'timestamp': datetime.now().strftime('%H:%M:%S')}
+            self.send_to_client(recipient, payload)
+            
+        elif mtype == 'file':
+            recipient = message.get('recipient')
+            payload = {'type':'file','sender': sender,'filename': message.get('filename'),'filedata': message.get('filedata'),'filetype': message.get('filetype'),'timestamp': datetime.now().strftime('%H:%M:%S')}
+            if recipient: 
+                self.send_to_client(recipient, payload)
+            else: 
+                # FIX: Use global broadcast for room file messages too.
+                self.broadcast(payload, exclude=sender)
                 
-                mtype = msg.get('type')
+        elif mtype == 'create_room':
+            room_name = message.get('room_name')
+            with self.rooms_lock:
+                if room_name not in self.rooms: 
+                    # Add all current clients to the room's user list for call purposes
+                    self.rooms[room_name] = list(self.clients.keys()) 
+            self.broadcast({'type':'room_created','room_name':room_name,'creator':sender})
+        
+        # --- PRIVATE CALL SIGNALING ---
+        elif mtype == 'call_request':
+            recipient = message.get('recipient')
+            self.send_to_client(recipient, {'type':'call_request','caller':sender,'call_type':message.get('call_type'),'timestamp': datetime.now().strftime('%H:%M:%S')})
+        elif mtype == 'call_response':
+            caller = message.get('caller')
+            accepted = message.get('accepted')
+            call_type = message.get('call_type','both')
+            if accepted:
+                self.active_calls[sender] = caller
+                self.active_calls[caller] = sender
+            self.send_to_client(caller, {'type':'call_response','responder':sender,'accepted':accepted,'call_type':call_type})
+
+        # --- GROUP CALL SIGNALING ---
+        elif mtype == 'group_call_request':
+            room = message.get('room')
+            call_type = message.get('call_type','video')
+            with self.rooms_lock:
+                if room not in self.rooms: return
+            
+            if room not in self.active_calls: self.active_calls[room] = set()
+            self.active_calls[room].add(sender)
+            
+            # Broadcast request to all room members (excluding the caller)
+            self.broadcast_to_room(room, {
+                'type':'group_call_request',
+                'room':room,
+                'caller':sender,
+                'call_type':call_type,
+                'timestamp': datetime.now().strftime('%H:%M:%S')
+            }, exclude=sender)
+
+        # --- MEDIA DATA FORWARDING ---
+        elif mtype == 'call_data':
+            if 'peer' in message: # Private Call Data
+                peer = message.get('peer')
+                payload = {'type':'call_data','sender':sender,'data': message.get('data'),'data_type': message.get('data_type')}
+                self.send_to_client(peer, payload)
+            
+            elif 'room' in message: # Group Call Data
+                room = message.get('room')
+                if room in self.active_calls and isinstance(self.active_calls[room], set):
+                    # Forward to all active call members in the room (excluding sender)
+                    for user in list(self.active_calls[room]):
+                        if user != sender:
+                            payload = {'type':'call_data','sender':sender,'data': message.get('data'),'data_type': message.get('data_type')}
+                            self.send_to_client(user, payload)
+            else:
+                print("[SERVER] Invalid call_data payload (missing peer/room)")
+
+
+        # --- END CALL ---
+        elif mtype == 'end_call':
+            is_group = message.get('is_group', False)
+            
+            if is_group:
+                room = message.get('room')
+                if room in self.active_calls and isinstance(self.active_calls[room], set):
+                    self.active_calls[room].discard(sender)
+                    if not self.active_calls[room]:
+                        self.active_calls.pop(room, None)
+                        self.broadcast_to_room(room, {'type':'call_ended','peer':room}) # Notify room call is over
+                self.send_to_client(sender, {'type':'call_ended','peer':room}) # Self-confirmation
                 
-                # --- TEXT & CONTROL MESSAGES ---
-                if mtype == 'broadcast':
-                    text = msg.get('msg', '')
-                    broadcast({"type": "broadcast", "from": username, "msg": text}, exclude_username=username)
-                
-                elif mtype == 'pm':
-                    to = msg.get('to')
-                    text = msg.get('msg', '')
-                    with clients_lock:
-                        target_sock = clients.get(to)
-                    if target_sock:  
-                        send_json(target_sock, {"type": "pm", "from": username, "msg": text})
-                    else:
-                        send_json(conn, {"type": "system", "msg": f"User {to} not found or offline."})
+            else: # Private Call
+                if sender in self.active_calls:
+                    peer = self.active_calls.pop(sender, None)
+                    if peer and peer in self.active_calls:
+                        self.active_calls.pop(peer, None)
+                        self.send_to_client(peer, {'type':'call_ended','peer':sender})
+                self.send_to_client(sender, {'type':'call_ended','peer':sender})
 
-                # --- ROOM OPERATIONS (TCP) ---
-                elif mtype == 'create_room':
-                    room = msg.get('room')
-                    with rooms_lock: rooms.setdefault(room, set())
-                    send_json(conn, {"type": "system", "msg": f"Room '{room}' created."})
+        else:
+            print("[SERVER] Unknown message type from", sender, mtype)
 
-                elif mtype == 'join_room':
-                    room = msg.get('room')  
-                    with rooms_lock: rooms.setdefault(room, set()).add(username)
-                    send_json(conn, {"type": "system", "msg": f"You joined room '{room}'."})
+    def disconnect(self, username):
+        if not username: return
+        with self.clients_lock:
+            sock = self.clients.pop(username, None)
+            if sock:
+                try: sock.close()
+                except: pass
+        with self.rooms_lock:
+            for room, users in self.rooms.items():
+                if username in users: users.remove(username)
+        
+        # End any active private call
+        if username in self.active_calls:
+            peer = self.active_calls.pop(username, None)
+            if peer and peer in self.active_calls:
+                self.active_calls.pop(peer, None)
+                self.send_to_client(peer, {'type':'call_ended','peer':username})
 
-                elif mtype == 'leave_room':
-                    room = msg.get('room')
-                    with rooms_lock: 
-                        if room in rooms and username in rooms[room]:
-                            rooms[room].discard(username)
-                    send_json(conn, {"type": "system", "msg": f"You left room '{room}'."})
+        # End any active group calls the user was in
+        rooms_to_check = list(self.active_calls.keys())
+        for room in rooms_to_check:
+            if isinstance(self.active_calls.get(room), set) and username in self.active_calls[room]:
+                 self.active_calls[room].discard(username)
+                 if not self.active_calls[room]:
+                    self.active_calls.pop(room, None)
+                    self.broadcast_to_room(room, {'type':'call_ended','peer':room})
 
-                elif mtype == 'room_msg':
-                    room = msg.get('room')
-                    text = msg.get('msg', '')
-                    broadcast_room(room, {"type": "room_msg", "from": username, "room": room, "msg": text}, exclude_username=username)
+        print(f"[SERVER] {username} disconnected")
+        self.broadcast({'type':'user_left','username':username,'timestamp':datetime.now().strftime('%H:%M:%S')})
+        self.broadcast_client_list()
 
-                elif mtype == 'list':
-                    send_active_users(to_sock=conn)
-
-                # --- FILE TRANSFER (TCP) ---
-                elif mtype in ('file_init', 'file_chunk', 'file_end'):
-                    to = msg.get('to')
-                    room = msg.get('room')
-                    
-                    forwarded = dict(msg)
-                    forwarded['from'] = username
-
-                    if to:
-                        with clients_lock: target_sock = clients.get(to)
-                        if target_sock:
-                            send_json(target_sock, forwarded)
-                        else:
-                            send_json(conn, {"type": "system", "msg": f"User {to} not found or offline."})
-                    elif room:
-                        broadcast_room(room, forwarded, exclude_username=username)
-                    else:
-                        send_json(conn, {"type": "system", "msg": "File transfer missing 'to' or 'room' field."})
-
-                # --- UDP STREAM INITIATION (TCP Control Message) ---
-                elif mtype == 'stream_init':
-                    client_udp_port = msg.get('udp_port')
-                    if client_udp_port and username:
-                        # Use the client's TCP IP address (addr[0]) but the UDP port provided by the client
-                        client_ip = addr[0] 
-                        client_udp_addr = (client_ip, client_udp_port)
-                        with clients_lock:
-                             user_to_udp_addr[username] = client_udp_addr
-                        print(f"[{username}] registered UDP: {client_udp_addr} via stream_init")
-                        send_json(conn, {"type": "system", "msg": "UDP address registered."})
-                    else:
-                        send_json(conn, {"type": "system", "msg": "Missing 'udp_port' or not registered."})
-                
-                # --- CALL SIGNALING (TCP - Requirement for Calls) ---
-                elif mtype in ('call_request', 'call_accepted', 'call_rejected', 'call_end'):
-                    to = msg.get('to')
-                    forwarded = dict(msg) # Forward the whole object as is
-                    
-                    with clients_lock:
-                        target_sock = clients.get(to)
-                    
-                    if target_sock:
-                        send_json(target_sock, forwarded)
-                    else:
-                        # Only send error if it's a request, otherwise ignore
-                        if mtype == 'call_request':
-                            send_json(conn, {"type": "system", "msg": f"User {to} is offline."})
-
-
-                # --- OTHER / UNKNOWN ---
-                else:
-                    send_json(conn, {"type": "system", "msg": f"Unknown message type: {mtype}"})
-
-    except Exception as e:
-        print(f"[!] Exception in client thread ({addr}): {e}")
-        traceback.print_exc()
-    finally:
-        try: conn.close()
-        except: pass
-        safe_remove_client_by_socket(conn)
-        print(f"[-] Connection closed {addr}")
-
-def main():
-    print("Starting HYBRID TCP/UDP chat server...")
-    
-    # Start UDP listener thread first
-    udp_thread = threading.Thread(target=udp_listener_thread, daemon=True)
-    udp_thread.start()
-
-    # Start TCP listener
-    tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    tcp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    try:
-        tcp_sock.bind((HOST, TCP_PORT))
-        tcp_sock.listen(100) 
-        print(f"TCP control listening on {HOST}:{TCP_PORT}")
-
-        while True:
-            conn, addr = tcp_sock.accept()
-            # Start a new thread for each TCP connection
-            t = threading.Thread(target=handle_client_connection, args=(conn, addr), daemon=True)    
-            t.start() 
-    except KeyboardInterrupt:
-        print("Shutting down server...")
-    finally:
-        tcp_sock.close()    
-
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    server = ChatServer(host='0.0.0.0', port=5555)   
+    server.start()
