@@ -75,10 +75,10 @@ The Tkinter-based GUI makes it easy to communicate, create rooms, share files, a
 * Error handling & reconnection
 
 🗂️ File Structure
-* Chat-System/
-  │
-  ├── Chat_Server.py      # Main server file (TCP + UDP)
-  ├── Chat_Client.py      # GUI Client with audio/video support
+* Chat-System/  
+  │  
+  ├── Chat_Server.py      # Main server file (TCP + UDP)  
+  ├── Chat_Client.py      # GUI Client with audio/video support  
   └── README.md           # Project Documentation
 
 🛠️ Required Libraries
@@ -115,7 +115,7 @@ Note: tkinter, threading, socket, json are built into Python.
   * Video Call	Start Video Call 📹
   * End Call	End Current Call 🛑
     
-👤 Author
+👤 Author  
     Humair Ali  
     UET | Computer Science  
     Python | Networking | OOP | Cyber Security
