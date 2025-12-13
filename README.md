@@ -3,58 +3,46 @@
 
 This project is a Python-based Multimedia Chat System that supports:
 
-  ✅ Multi-client text messaging
-  ✅ Private messaging (PM)
-  ✅ Group / Room messaging
-  ✅ File sharing
-  ✅ Voice notes
-  ✅ Real-time audio calls
-  ✅ Real-time video calls
-  ✅ Active users list
-  ✅ Dark-mode GUI
-  ✅ Hybrid TCP + UDP architecture
+  ✅ Multi-client text messaging.
+  ✅ Private messaging (PM).
+  ✅ Group / Room messaging.
+  ✅ File sharing.
+  ✅ Voice notes.
+  ✅ Real-time audio calls.
+  ✅ Real-time video calls.
+  ✅ Active users list.
+  ✅ Dark-mode GUI.
+  ✅ Hybrid TCP + UDP architecture.
 
 It uses TCP for control, messaging, and file transfer, while UDP is used for real-time audio and video streaming to ensure low latency and smooth performance.
 The Tkinter-based GUI makes it easy to communicate, create rooms, share files, and start audio/video calls — all inside one application.
 
 ⚙️ Technologies Used
-      Python
-      Socket Programming (TCP & UDP)
-      Multithreading
-      Tkinter (GUI)
-      OpenCV (Video Streaming)
-      SoundDevice (Audio Processing)
-      NumPy & SciPy (Media Processing)
-      JSON (Data Communication)
+* Python
+* Socket Programming (TCP & UDP)
+* Multithreading
+* Tkinter (GUI)
+* OpenCV (Video Streaming)
+* SoundDevice (Audio Processing)
+* NumPy & SciPy (Media Processing)
+* JSON (Data Communication)
 
 🧠 How It Works
 🔷 TCP is used for:
-
-Text messages
-
-File transfer
-
-Room creation / join / leave
-
-Call signaling (request, accept, reject, end)
-
-User registration
-
-User list updates
+* Text messages
+* File transfer
+* Room creation / join / leave
+* Call signaling (request, accept, reject, end)
+* User registration
+* User list updates
 
 🔶 UDP is used for:
-
-Live audio streaming
-
-Live video streaming
-
-This hybrid model makes the system:
-
-Fast ⚡
-
-Stable 🧱
-
-Suitable for real-time communication 🎥🎧
+* Live audio streaming.
+* Live video streaming.
+* This hybrid model makes the system:
+  * Fast ⚡
+  * Stable 🧱
+  * Suitable for real-time communication 🎥🎧
 
 🖥️ Features
 🗨️ Messaging
